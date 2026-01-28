@@ -14,6 +14,7 @@ from datetime import datetime
 
 import torch
 from safetensors.torch import load_file
+from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -50,7 +51,8 @@ def merge_adapter_weights(
     model_state_dict = base_model.state_dict()
     is_gpt_oss = "GptOss" in str(type(base_model))
 
-    for n in adapter_weight_names:
+    log(f"Merging {len(adapter_weight_names)} LoRA layers into base model")
+    for n in tqdm(adapter_weight_names, desc="Merging LoRA layers", unit="layer"):
         target_key = n.replace("base_model.model.", "").replace("model.unembed_tokens", "lm_head")
         lora_A = adapter_weights[n.replace(".weight", ".lora_A.weight")].float()
         lora_B = adapter_weights[n.replace(".weight", ".lora_B.weight")].float() * scaling

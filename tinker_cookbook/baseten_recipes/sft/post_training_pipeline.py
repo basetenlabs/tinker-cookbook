@@ -10,6 +10,7 @@ Handles:
 
 import logging
 import os
+import shutil
 import subprocess
 import tarfile
 import tempfile
@@ -17,8 +18,31 @@ import urllib.request
 from typing import Any
 
 import tinker
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+
+
+class DownloadProgressBar:
+    """Progress bar for urllib download."""
+
+    def __init__(self):
+        self.pbar = None
+
+    def __call__(self, block_num, block_size, total_size):
+        if self.pbar is None:
+            self.pbar = tqdm(
+                total=total_size,
+                unit='B',
+                unit_scale=True,
+                unit_divisor=1024,
+                desc="Downloading checkpoint"
+            )
+        downloaded = block_num * block_size
+        if downloaded < total_size:
+            self.pbar.update(block_size)
+        else:
+            self.pbar.close()
 
 
 def download_checkpoint(tinker_path: str, output_dir: str) -> str:
@@ -31,6 +55,22 @@ def download_checkpoint(tinker_path: str, output_dir: str) -> str:
     Returns:
         Path to the extracted adapter directory
     """
+    adapter_dir = os.path.join(output_dir, "adapter")
+    expected_files = ["adapter_model.safetensors", "adapter_config.json"]
+
+    # Check if checkpoint already exists
+    if os.path.exists(adapter_dir):
+        all_files_exist = all(
+            os.path.exists(os.path.join(adapter_dir, file))
+            for file in expected_files
+        )
+        if all_files_exist:
+            logger.info(f"✓ Checkpoint already exists at {adapter_dir}, skipping download")
+            return adapter_dir
+        else:
+            logger.info(f"Incomplete checkpoint found, re-downloading")
+            shutil.rmtree(adapter_dir)
+
     logger.info(f"Downloading checkpoint from {tinker_path}")
 
     # Create service and REST client
@@ -48,18 +88,24 @@ def download_checkpoint(tinker_path: str, output_dir: str) -> str:
     tar_path = os.path.join(output_dir, "checkpoint.tar")
 
     logger.info(f"Downloading archive to {tar_path}")
-    urllib.request.urlretrieve(checkpoint_archive_url_response.url, tar_path)
+    urllib.request.urlretrieve(
+        checkpoint_archive_url_response.url,
+        tar_path,
+        reporthook=DownloadProgressBar()
+    )
 
     # Extract the archive
-    adapter_dir = os.path.join(output_dir, "adapter")
     os.makedirs(adapter_dir, exist_ok=True)
 
     logger.info(f"Extracting archive to {adapter_dir}")
     with tarfile.open(tar_path, "r") as tar:
-        tar.extractall(adapter_dir)
+        members = tar.getmembers()
+        with tqdm(total=len(members), desc="Extracting checkpoint", unit="files") as pbar:
+            for member in members:
+                tar.extract(member, adapter_dir)
+                pbar.update(1)
 
     # Verify expected files exist
-    expected_files = ["adapter_model.safetensors", "adapter_config.json"]
     for file in expected_files:
         file_path = os.path.join(adapter_dir, file)
         if not os.path.exists(file_path):
@@ -84,6 +130,11 @@ def merge_adapter(base_model: str, adapter_path: str, output_path: str) -> str:
     logger.info(f"Adapter path: {adapter_path}")
     logger.info(f"Output path: {output_path}")
 
+    # Remove existing output directory if it exists
+    if os.path.exists(output_path):
+        logger.info(f"Removing existing output directory: {output_path}")
+        shutil.rmtree(output_path)
+
     # Call the merge script as subprocess
     merge_script = "tinker_cookbook/scripts/merge_tinker_adapter_to_hf_model.py"
 
@@ -99,14 +150,16 @@ def merge_adapter(base_model: str, adapter_path: str, output_path: str) -> str:
     ]
 
     logger.info(f"Running merge command: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    logger.info("Note: Transformers will show download progress bars below")
+
+    # Run without capturing stdout/stderr so progress bars display properly
+    result = subprocess.run(cmd)
 
     if result.returncode != 0:
-        logger.error(f"Merge failed with stderr:\n{result.stderr}")
-        raise RuntimeError(f"Adapter merge failed: {result.stderr}")
+        logger.error(f"Merge failed with return code: {result.returncode}")
+        raise RuntimeError(f"Adapter merge failed with return code: {result.returncode}")
 
     logger.info(f"Merge completed successfully")
-    logger.info(f"Merge output:\n{result.stdout}")
 
     return output_path
 
