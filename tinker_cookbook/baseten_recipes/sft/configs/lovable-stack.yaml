@@ -2,7 +2,7 @@
 
 # Model configuration
 model:
-  name: "Qwen/Qwen3-30B-A3B-Instruct-2507"
+  name: "Qwen/Qwen3-4B-Instruct-2507"
   lora_rank: 64
   renderer_name: null  # Auto-detect (will use qwen3)
 
