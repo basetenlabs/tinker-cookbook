@@ -276,3 +276,38 @@ class TestShutdownCascade:
             assert received_items == [42]
 
         asyncio.run(_test())
+
+
+class TestBackpressure:
+    def test_dataloader_gate_bounds_lead(self):
+        """
+        The dataloader gate keeps the sampler at most max_steps_off_policy batches
+        ahead of the trainer, and never deadlocks (the wait_for timeout would fire).
+        """
+
+        async def _test():
+            end_batch = 6
+            max_steps_off_policy = 2
+            sampling_client_step = 0
+            trainer_stepped = asyncio.Event()
+            max_lead = 0
+
+            async def dataloader_loop():
+                nonlocal max_lead
+                for i_batch in range(end_batch):
+                    while i_batch - sampling_client_step > max_steps_off_policy:
+                        trainer_stepped.clear()
+                        await trainer_stepped.wait()
+                    max_lead = max(max_lead, i_batch - sampling_client_step)
+
+            async def training_loop():
+                nonlocal sampling_client_step
+                for _ in range(end_batch):
+                    await asyncio.sleep(0)  # trainer lags the fast dataloader
+                    sampling_client_step += 1
+                    trainer_stepped.set()
+
+            await asyncio.wait_for(asyncio.gather(dataloader_loop(), training_loop()), timeout=5.0)
+            assert max_lead == max_steps_off_policy
+
+        asyncio.run(_test())
