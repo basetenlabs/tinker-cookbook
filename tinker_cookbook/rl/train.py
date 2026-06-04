@@ -929,6 +929,11 @@ async def do_async_training(
     )
     trajectory_groups_queue = asyncio.Queue[WrappedTrajectoryGroup | _Shutdown | None]()
 
+    # Lets dataloader_loop avoid running more than max_steps_off_policy batches
+    # ahead of the trainer; set whenever the trainer finishes a step.
+    max_steps_off_policy = config.async_config.max_steps_off_policy
+    trainer_stepped = asyncio.Event()
+
     # Initial sampling client to use
     path_dict = await checkpoint_utils.save_checkpoint_async(
         training_client=training_client,
@@ -964,6 +969,11 @@ async def do_async_training(
         i_batch = start_batch
         while i_batch < end_batch:
             env_group_builders_P = dataset.get_batch(i_batch)
+            # Wait for the trainer to catch up before queueing more work, so we
+            # don't sample with weights that are too stale.
+            while i_batch - sampling_client_step > max_steps_off_policy:
+                trainer_stepped.clear()
+                await trainer_stepped.wait()
             for env_group_builder in env_group_builders_P:
                 await env_group_builders_queue.put(env_group_builder)
             i_batch += 1
@@ -1204,6 +1214,8 @@ async def do_async_training(
             ml_logger.log_metrics(metrics, step=i_batch)
             i_batch += 1
             wrapped_trajectory_groups = []
+            # Let the dataloader queue more work now that we've finished a step.
+            trainer_stepped.set()
 
         # Signal evaluation loop to shut down
         evaluation_loop_should_shutdown_event.set()
