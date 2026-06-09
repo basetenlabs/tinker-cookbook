@@ -110,11 +110,33 @@ def _compute_trajectory_metrics(trajectory_groups_P: list[TrajectoryGroup]) -> d
     total_episodes = len(flat_trajs_PG)
     total_ac_tokens = sum(ac_tokens_by_turn)
     total_ob_tokens = sum(ob_tokens_by_turn)
+    # Per-episode input-context length: the largest prompt the model was ever shown. Observations are
+    # full-history (each transition.ob is the whole rendered conversation so far — the env returns the
+    # entire conversation in next_messages and EnvFromMessageEnv renders it verbatim, no
+    # accumulation), so ob grows every turn and already contains every *prior* action. We do NOT add
+    # the current action: it is generated output, not input context — it only counts once it lands in
+    # the next turn's ob (which already includes it), and the final turn's action is never shown back
+    # to the model at all. So the max ob over transitions is exactly the peak input context, directly
+    # comparable to max_trajectory_tokens. (max over transitions, not final_ob.length, because
+    # final_ob is empty on truncation/parse-error/overflow terminations. Do NOT sum ob across turns:
+    # each ob already contains all prior turns — that's a ~quadratic over-count.)
+    context_tokens_by_episode = [
+        max((t.ob.length for t in traj.transitions), default=0) for traj in flat_trajs_PG
+    ]
+    total_context_tokens = sum(context_tokens_by_episode)
     # Compute metrics
     metrics = {
         "ac_tokens_per_turn": total_ac_tokens / total_turns if total_turns > 0 else 0.0,
         "ob_tokens_per_turn": total_ob_tokens / total_turns if total_turns > 0 else 0.0,
         "turns_per_episode": total_turns / total_episodes if total_episodes > 0 else 0.0,
+        # ac_tokens_per_episode: tokens the policy generated over an episode.
+        # context_tokens_per_episode (mean) / max_context_tokens (peak): the per-episode context
+        # length the model sees — the number to watch against max_trajectory_tokens (the 32K cap).
+        "ac_tokens_per_episode": total_ac_tokens / total_episodes if total_episodes > 0 else 0.0,
+        "context_tokens_per_episode": total_context_tokens / total_episodes
+        if total_episodes > 0
+        else 0.0,
+        "max_context_tokens": float(max(context_tokens_by_episode, default=0)),
         "total_episodes": total_episodes,
         "total_turns": total_turns,
         "total_ac_tokens": total_ac_tokens,

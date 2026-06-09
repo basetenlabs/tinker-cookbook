@@ -65,7 +65,7 @@ from tinker_cookbook.rl.types import (
 from tinker_cookbook.tokenizer_utils import Tokenizer
 from tinker_cookbook.utils import logtree, ml_log, trace
 from tinker_cookbook.utils.git_rev import recipe_user_metadata
-from tinker_cookbook.utils.misc_utils import iteration_dir, safezip, split_list
+from tinker_cookbook.utils.misc_utils import all_same, iteration_dir, safezip, split_list
 
 logger = logging.getLogger(__name__)
 
@@ -715,6 +715,11 @@ async def do_sync_training_with_stream_minibatch(
                 ] = asyncio.Queue()
                 env_group_builders_P = dataset.get_batch(i_batch)
 
+                # Capture every group BEFORE constant-reward filtering, so end-of-step trajectory
+                # metrics are computed over the full batch (honest) rather than only the trained,
+                # mixed-reward groups. Populated only when filtering is enabled (else unused).
+                full_batch_groups: list[tuple[TrajectoryGroup, EnvGroupBuilder]] = []
+
                 @trace.scope
                 async def trajectory_group_worker_task(
                     builder: EnvGroupBuilder, enable_logging: bool
@@ -722,15 +727,25 @@ async def do_sync_training_with_stream_minibatch(
                     worker_metrics: dict[str, Any] = {}
                     t_start = time.time()
                     async with trace.scope_span("trajectory_group_worker"):
+                        # Roll out unfiltered, then apply the constant-reward filter here. This keeps
+                        # the full batch observable for honest metrics (full_batch_groups, passed to
+                        # the train step for end-of-step metrics) while leaving training behaviour
+                        # byte-identical: constant groups still become None (not trained, ingested as
+                        # skipped) exactly as if the filter ran inside the rollout. Capture+filter
+                        # only run when filtering is enabled.
                         trajectory_group = await do_group_rollout_and_filter_constant_reward(
                             sampling_client,
                             builder,
                             max_tokens=config.max_tokens,
                             temperature=config.temperature,
-                            do_remove_constant_reward_groups=config.remove_constant_reward_groups,
+                            do_remove_constant_reward_groups=False,
                             enable_logging=enable_logging,
                             strategy=strategy,
                         )
+                        if config.remove_constant_reward_groups and trajectory_group is not None:
+                            full_batch_groups.append((trajectory_group, builder))
+                            if all_same(trajectory_group.get_total_rewards()):
+                                trajectory_group = None
                     worker_metrics["time/trajectory_group_worker_loop/total"] = (
                         time.time() - t_start
                     )
@@ -759,7 +774,10 @@ async def do_sync_training_with_stream_minibatch(
                         name=f"trajectory_group_worker_task_{i}",
                     )
 
-                # Run multiple optimizer substeps per training iteration
+                # Run multiple optimizer substeps per training iteration. When constant-reward groups
+                # are filtered out of training, pass the full pre-filter batch for metrics so the
+                # standard trajectory metrics (env/all/*, by_group/frac_*) stay honest rather than
+                # being computed only over the surviving (mixed) groups.
                 streaming_result = await do_train_step_streaming_and_get_sampling_client(
                     config,
                     i_batch,
@@ -768,6 +786,9 @@ async def do_sync_training_with_stream_minibatch(
                     checkpoint_mgr,
                     kl_reference_client,
                     tokenizer,
+                    metrics_groups=(
+                        full_batch_groups if config.remove_constant_reward_groups else None
+                    ),
                 )
                 # _Shutdown cannot appear in the sync path's local queue
                 assert streaming_result is not None, "Unexpected shutdown in sync streaming path"
@@ -1298,6 +1319,7 @@ async def prepare_minibatch(
     kl_reference_client: tinker.SamplingClient | None,
     kl_penalty_coef: float,
     kl_discount_factor: float,
+    compute_metrics: bool = True,
 ) -> tuple[list[tinker.Datum], dict[str, Any]]:
     """Convert trajectory groups into training data with computed advantages.
 
@@ -1317,6 +1339,10 @@ async def prepare_minibatch(
             to 0 to disable.
         kl_discount_factor (float): Position-based discount factor for KL
             penalty terms.
+        compute_metrics (bool): Whether to compute per-batch trajectory metrics.
+            Set False when the caller computes them once elsewhere (e.g. the
+            streaming loop computes them over the full pre-filter batch at
+            end-of-step), to avoid redundant passes that would be overwritten.
 
     Returns:
         tuple[list[tinker.Datum], dict[str, Any]]: A list of training datums
@@ -1325,8 +1351,9 @@ async def prepare_minibatch(
 
     # Compute trajectory metrics
     metrics = {}
-    taglist_P = [env_group_builder.logging_tags() for env_group_builder in env_group_builders_P]
-    metrics.update(compute_trajectory_metrics(trajectory_groups_P, taglist_P))
+    if compute_metrics:
+        taglist_P = [env_group_builder.logging_tags() for env_group_builder in env_group_builders_P]
+        metrics.update(compute_trajectory_metrics(trajectory_groups_P, taglist_P))
 
     # Print up to two trajectory groups
     for traj_group in trajectory_groups_P[:2]:
@@ -1416,6 +1443,7 @@ async def do_train_step_streaming_and_get_sampling_client(
     kl_reference_client: tinker.SamplingClient | None,
     tokenizer: Tokenizer,
     trajectory_group_filter: Callable[[WrappedTrajectoryGroup | None], bool] = lambda _: True,
+    metrics_groups: list[tuple[TrajectoryGroup, EnvGroupBuilder]] | None = None,
 ) -> tuple[tinker.SamplingClient, dict[str, Any], list[WrappedTrajectoryGroup]] | None:
     """Consume trajectory groups from a queue and train as minibatches become ready.
 
@@ -1439,6 +1467,13 @@ async def do_train_step_streaming_and_get_sampling_client(
         trajectory_group_filter (Callable): Predicate applied to each
             dequeued group. Groups for which the filter returns False are
             skipped. Defaults to accepting all groups.
+        metrics_groups (list[tuple[TrajectoryGroup, EnvGroupBuilder]] | None):
+            Optional explicit (group, builder) pairs to compute the end-of-step
+            trajectory metrics over. Pass the full pre-filter batch here so the
+            metrics stay honest when constant-reward groups are filtered out of
+            training. When None, metrics are computed over the trained groups
+            (the trajectory-metric pass inside ``prepare_minibatch`` is skipped
+            either way to avoid redundant overwritten passes).
 
     Returns:
         tuple[tinker.SamplingClient, dict[str, Any], list[WrappedTrajectoryGroup]] | None:
@@ -1502,6 +1537,9 @@ async def do_train_step_streaming_and_get_sampling_client(
                 kl_reference_client,
                 kl_penalty_coef=config.kl_penalty_coef,
                 kl_discount_factor=config.kl_discount_factor,
+                # Trajectory metrics are computed once at end-of-step (below) over the full batch;
+                # per-minibatch passes here would only be overwritten, so skip them.
+                compute_metrics=False,
             )
             metrics.update(prepare_minibatch_metrics)
 
@@ -1521,46 +1559,62 @@ async def do_train_step_streaming_and_get_sampling_client(
             i_minibatch += 1
             wrapped_trajectory_groups = []
 
-        # Enqueue optim_step before awaiting results (so they land on same clock cycle)
-        adam_params = tinker.AdamParams(
-            learning_rate=config.learning_rate, beta1=0.9, beta2=0.95, eps=1e-8
-        )
-        async with trace.scope_span(f"train/optim_substep_{i_substep}_enqueue"):
-            optim_future = await training_client.optim_step_async(adam_params)
+        # Skip the optimizer step on an empty substep (e.g. all groups in this batch were filtered
+        # for constant reward) — optim_step with no accumulated gradients is a no-op at best.
+        if forward_backward_futures:
+            # Enqueue optim_step before awaiting results (so they land on same clock cycle)
+            adam_params = tinker.AdamParams(
+                learning_rate=config.learning_rate, beta1=0.9, beta2=0.95, eps=1e-8
+            )
+            async with trace.scope_span(f"train/optim_substep_{i_substep}_enqueue"):
+                optim_future = await training_client.optim_step_async(adam_params)
 
-        # Now consume all forward-backward results
-        for i_mb, fwd_bwd_future in enumerate(forward_backward_futures):
-            async with trace.scope_span(f"train/fwd_bwd_substep_{i_substep}_mb_{i_mb}_consume"):
-                fwd_bwd_result = await fwd_bwd_future.result_async()
-                all_training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(fwd_bwd_result))
+            # Now consume all forward-backward results
+            for i_mb, fwd_bwd_future in enumerate(forward_backward_futures):
+                async with trace.scope_span(f"train/fwd_bwd_substep_{i_substep}_mb_{i_mb}_consume"):
+                    fwd_bwd_result = await fwd_bwd_future.result_async()
+                    all_training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(fwd_bwd_result))
 
-        async with trace.scope_span(f"train/optim_substep_{i_substep}_consume"):
-            optim_result = await optim_future.result_async()
+            async with trace.scope_span(f"train/optim_substep_{i_substep}_consume"):
+                optim_result = await optim_future.result_async()
 
-        if optim_result.metrics:
-            metrics.update(optim_result.metrics)
+            if optim_result.metrics:
+                metrics.update(optim_result.metrics)
 
-    # Aggregate metrics across the entire batch
+    # Aggregate metrics across the entire batch. Sampling/staleness metrics are over the groups we
+    # actually trained on; trajectory metrics (reward, by_group/frac_*, env/all/*) are computed once
+    # here over `metrics_groups` when provided — the full pre-filter batch — so they stay honest even
+    # when constant-reward groups are filtered out of training. Falls back to the trained groups.
     metrics.update(compute_sampling_client_metrics(all_wrapped_trajectory_groups))
-    metrics.update(
-        compute_trajectory_metrics(
-            [g.trajectory_group for g in all_wrapped_trajectory_groups],
-            [g.env_group_builder.logging_tags() for g in all_wrapped_trajectory_groups],
+    if metrics_groups is not None:
+        metric_trajectory_groups = [tg for tg, _ in metrics_groups]
+        metric_taglists = [builder.logging_tags() for _, builder in metrics_groups]
+    else:
+        metric_trajectory_groups = [g.trajectory_group for g in all_wrapped_trajectory_groups]
+        metric_taglists = [g.env_group_builder.logging_tags() for g in all_wrapped_trajectory_groups]
+    metrics.update(compute_trajectory_metrics(metric_trajectory_groups, metric_taglists))
+    if all_data_D:
+        (
+            sampling_client,
+            full_batch_metrics,
+        ) = await compute_full_batch_metrics_and_get_sampling_client(
+            training_client,
+            checkpoint_mgr,
+            # NOTE: saving the checkpoint as the i + 1 step
+            i_batch + 1,
+            all_data_D,
+            all_training_logprobs_D,
+            config.compute_post_kl,
         )
-    )
-    (
-        sampling_client,
-        full_batch_metrics,
-    ) = await compute_full_batch_metrics_and_get_sampling_client(
-        training_client,
-        checkpoint_mgr,
-        # NOTE: saving the checkpoint as the i + 1 step
-        i_batch + 1,
-        all_data_D,
-        all_training_logprobs_D,
-        config.compute_post_kl,
-    )
-    metrics.update(full_batch_metrics)
+        metrics.update(full_batch_metrics)
+    else:
+        # The whole batch was filtered (every group had constant reward) -> no trainable data, so
+        # the weights are unchanged. Skip the optimizer/KL/checkpoint step and reuse current weights,
+        # mirroring the sync loop's batch_skipped path. (compute_kl_sample_train would otherwise
+        # assert on empty data.) The honest trajectory metrics above still record the batch.
+        logger.warning(f"[stream_minibatch] Step {i_batch}: all groups filtered; skipping update.")
+        metrics["batch_skipped"] = 1.0
+        sampling_client = await training_client.save_weights_and_get_sampling_client_async()
     return sampling_client, metrics, all_wrapped_trajectory_groups
 
 
