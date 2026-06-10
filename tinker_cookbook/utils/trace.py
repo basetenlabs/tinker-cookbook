@@ -135,6 +135,12 @@ class IterationWindow:
             ml_logger.log_metrics(metrics, step=i_batch)
     """
 
+    # Span names that additionally get p50/p90/p99 duration percentiles in
+    # aggregate() when they occur at least 4 times within the window.
+    PERCENTILE_SPANS: frozenset[str] = frozenset(
+        {"policy_sample", "env_step", "train/fwd_bwd_wait", "train/optim_wait"}
+    )
+
     def __init__(self) -> None:
         self.spans: list[SpanRecord] = []
         self._lock = threading.Lock()
@@ -168,7 +174,10 @@ class IterationWindow:
 
         Single-occurrence spans produce ``time/{name}``. Multi-occurrence
         spans produce ``time/{name}:total``, ``time/{name}:count``,
-        ``time/{name}:mean``, and ``time/{name}:max``.
+        ``time/{name}:mean``, and ``time/{name}:max``. Span names listed in
+        :attr:`PERCENTILE_SPANS` with at least 4 occurrences additionally
+        produce ``time/{name}:p50``, ``time/{name}:p90``, and
+        ``time/{name}:p99``.
 
         Returns:
             dict[str, float]: Flat dictionary of timing metrics.
@@ -195,6 +204,12 @@ class IterationWindow:
                 metrics[f"time/{name}:count"] = len(durations)
                 metrics[f"time/{name}:mean"] = sum(durations) / len(durations)
                 metrics[f"time/{name}:max"] = max(durations)
+                if name in self.PERCENTILE_SPANS and len(durations) >= 4:
+                    sorted_durations = sorted(durations)
+                    n = len(sorted_durations)
+                    for quantile, label in ((0.5, "p50"), (0.9, "p90"), (0.99, "p99")):
+                        idx = min(round(quantile * (n - 1)), n - 1)
+                        metrics[f"time/{name}:{label}"] = sorted_durations[idx]
 
         return metrics
 

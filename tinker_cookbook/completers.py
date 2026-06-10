@@ -20,11 +20,20 @@ StopCondition: TypeAlias = list[str] | list[int]
 
 @dataclass
 class TokensWithLogprobs:
-    """A sequence of token IDs with optional log-probabilities and a stop reason."""
+    """A sequence of token IDs with optional log-probabilities and a stop reason.
+
+    The optional sampler-provenance fields (``policy_version``, ``sample_retries``,
+    ``sample_retry_wait_s``) are populated only when the underlying sampling
+    backend exposes them (e.g. the Loops tinker shim); they remain ``None`` on
+    real Tinker.
+    """
 
     tokens: list[int]
     maybe_logprobs: list[float] | None
     stop_reason: tinker.StopReason = "stop"
+    policy_version: int | None = None
+    sample_retries: int | None = None
+    sample_retry_wait_s: float | None = None
 
     @property
     def logprobs(self) -> list[float]:
@@ -128,10 +137,20 @@ class TinkerTokenCompleter(TokenCompleter):
         sampled_seq = sample_result.sequences[0]
         assert sampled_seq.logprobs is not None
 
+        # Sampler-provenance fields exist only on some SDK variants (e.g. the
+        # Loops tinker shim); real Tinker SampleResults lack them, so guard
+        # with getattr instead of importing the shim's types.
+        policy_version: int | None = getattr(sample_result, "policy_version", None)
+        sample_retries: int | None = getattr(sample_result, "client_retry_attempts", None)
+        sample_retry_wait_s: float | None = getattr(sample_result, "client_retry_wait_s", None)
+
         return TokensWithLogprobs(
             tokens=sampled_seq.tokens,
             maybe_logprobs=sampled_seq.logprobs,
             stop_reason=sampled_seq.stop_reason,
+            policy_version=policy_version,
+            sample_retries=sample_retries,
+            sample_retry_wait_s=sample_retry_wait_s,
         )
 
 

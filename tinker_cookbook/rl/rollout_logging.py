@@ -85,12 +85,14 @@ def serialize_rollout_summaries(
     Each record contains::
 
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "split": str, "iteration": int, "group_idx": int, "traj_idx": int,
             "tags": list[str], "sampling_client_step": int | None,
             "total_reward": float, "final_reward": float,
             "trajectory_metrics": dict, "final_ob_len": int,
-            "steps": [{"step_idx", "ob_len", "ac_len", "reward", "episode_done", "metrics", "logs"}, ...]
+            "steps": [{"step_idx", "ob_len", "ac_len", "reward", "episode_done",
+                       "policy_version", "sample_retries", "sample_retry_wait_s",
+                       "metrics", "logs"}, ...]
         }
 
     Args:
@@ -120,6 +122,9 @@ def serialize_rollout_summaries(
                         "ac_len": len(transition.ac.tokens),
                         "reward": transition.reward,
                         "episode_done": transition.episode_done,
+                        "policy_version": transition.ac.policy_version,
+                        "sample_retries": transition.ac.sample_retries,
+                        "sample_retry_wait_s": transition.ac.sample_retry_wait_s,
                         "metrics": transition.metrics,
                         "logs": transition.logs,
                     }
@@ -128,7 +133,7 @@ def serialize_rollout_summaries(
             records.append(
                 _json_safe(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "split": split,
                         "iteration": iteration,
                         "group_idx": group_idx,

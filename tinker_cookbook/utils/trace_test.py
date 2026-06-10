@@ -216,6 +216,45 @@ def test_iteration_window_mixed_spans():
     assert metrics["time/train"] == 1.0
 
 
+def test_iteration_window_percentile_spans():
+    """Spans in PERCENTILE_SPANS with >= 4 occurrences emit p50/p90/p99."""
+    window = IterationWindow()
+    for duration in [1.0, 2.0, 3.0, 4.0, 10.0]:
+        window.record_span("policy_sample", 0.0, duration)
+    metrics = window.aggregate()
+    # n=5: p50 idx=round(0.5*4)=2, p90 idx=round(0.9*4)=4, p99 idx=round(0.99*4)=4
+    assert metrics["time/policy_sample:p50"] == 3.0
+    assert metrics["time/policy_sample:p90"] == 10.0
+    assert metrics["time/policy_sample:p99"] == 10.0
+    # Standard aggregates still present
+    assert metrics["time/policy_sample:count"] == 5
+    assert metrics["time/policy_sample:max"] == 10.0
+
+
+def test_iteration_window_percentile_spans_below_threshold():
+    """Spans in PERCENTILE_SPANS with fewer than 4 occurrences emit no percentiles."""
+    window = IterationWindow()
+    for duration in [1.0, 2.0, 3.0]:
+        window.record_span("env_step", 0.0, duration)
+    metrics = window.aggregate()
+    assert metrics["time/env_step:count"] == 3
+    assert "time/env_step:p50" not in metrics
+    assert "time/env_step:p90" not in metrics
+    assert "time/env_step:p99" not in metrics
+
+
+def test_iteration_window_percentiles_only_for_listed_spans():
+    """Spans not in PERCENTILE_SPANS never emit percentiles, regardless of count."""
+    window = IterationWindow()
+    for duration in [1.0, 2.0, 3.0, 4.0, 5.0]:
+        window.record_span("unlisted_span", 0.0, duration)
+    metrics = window.aggregate()
+    assert metrics["time/unlisted_span:count"] == 5
+    assert "time/unlisted_span:p50" not in metrics
+    assert "time/unlisted_span:p90" not in metrics
+    assert "time/unlisted_span:p99" not in metrics
+
+
 def test_iteration_window_empty():
     window = IterationWindow()
     assert window.aggregate() == {}

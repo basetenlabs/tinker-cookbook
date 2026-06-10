@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import re
 import time
@@ -37,10 +38,12 @@ from tinker_cookbook.rl.data_processing import (
 )
 from tinker_cookbook.rl.metric_util import RLTestSetEvaluator, compute_trajectory_metrics
 from tinker_cookbook.rl.metrics import (
-    compute_kl_sample_train,
+    compute_kl_sample_train_extended,
+    compute_policy_version_metrics,
     compute_post_kl,
     compute_sampling_client_metrics,
     incorporate_kl_penalty,
+    read_trainer_policy_version,
 )
 from tinker_cookbook.rl.rollout_logging import (
     RolloutSummaryExportConfig,
@@ -282,6 +285,7 @@ async def train_step(
     loss_fn: LossFnType,
     loss_fn_config: dict[str, Any] | None = None,
     metrics: dict[str, Any] | None = None,
+    pipeline_optim_step: bool = True,
 ) -> list[torch.Tensor]:
     """Train the model on collected trajectories.
 
@@ -289,6 +293,12 @@ async def train_step(
     clock cycle, maximizing GPU utilization. The data is split into
     ``num_substeps`` batches; each batch is enqueued before consuming the
     previous result to keep the pipeline full.
+
+    With ``pipeline_optim_step=False`` the pipelining is disabled: each
+    ``forward_backward`` result is fully consumed before the corresponding
+    ``optim_step`` is enqueued. The returned logprobs are then guaranteed to
+    be computed at pre-update weights even on backends that don't serialize
+    pipelined operations against the returned tensors.
 
     Args:
         data_D (list[tinker.Datum]): Training data assembled from trajectory
@@ -327,32 +337,48 @@ async def train_step(
     training_logprobs_D: list[torch.Tensor] = []
     optim_result: tinker.OptimStepResponse | None = None
 
-    # Enqueue first batch
-    fwd_bwd_future = await training_client.forward_backward_async(
-        [_remove_mask(d) for d in batches[0]], loss_fn=loss_fn, loss_fn_config=loss_fn_config
-    )
-    optim_future = await training_client.optim_step_async(adam_params)
-
-    for i in range(len(batches)):
-        # Enqueue next batch before consuming current results (to stay on same clock cycle)
-        if i + 1 < len(batches):
-            next_fwd_bwd_future = await training_client.forward_backward_async(
-                [_remove_mask(d) for d in batches[i + 1]],
-                loss_fn=loss_fn,
-                loss_fn_config=loss_fn_config,
+    async def enqueue_fwd_bwd(batch: list[tinker.Datum]) -> tinker.APIFuture[tinker.ForwardBackwardOutput]:
+        async with trace.scope_span("train/fwd_bwd_enqueue"):
+            return await training_client.forward_backward_async(
+                [_remove_mask(d) for d in batch], loss_fn=loss_fn, loss_fn_config=loss_fn_config
             )
-            next_optim_future = await training_client.optim_step_async(adam_params)
-        else:
-            next_fwd_bwd_future = None
-            next_optim_future = None
-        # Consume current results
-        fwd_bwd_result = await fwd_bwd_future.result_async()
-        training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(fwd_bwd_result))
-        optim_result = await optim_future.result_async()
-        # Move to next iteration
-        if next_fwd_bwd_future is not None and next_optim_future is not None:
-            fwd_bwd_future = next_fwd_bwd_future
-            optim_future = next_optim_future
+
+    async def enqueue_optim() -> tinker.APIFuture[tinker.OptimStepResponse]:
+        async with trace.scope_span("train/optim_enqueue"):
+            return await training_client.optim_step_async(adam_params)
+
+    if pipeline_optim_step:
+        # Enqueue first batch
+        fwd_bwd_future = await enqueue_fwd_bwd(batches[0])
+        optim_future = await enqueue_optim()
+
+        for i in range(len(batches)):
+            # Enqueue next batch before consuming current results (to stay on same clock cycle)
+            if i + 1 < len(batches):
+                next_fwd_bwd_future = await enqueue_fwd_bwd(batches[i + 1])
+                next_optim_future = await enqueue_optim()
+            else:
+                next_fwd_bwd_future = None
+                next_optim_future = None
+            # Consume current results
+            async with trace.scope_span("train/fwd_bwd_wait"):
+                fwd_bwd_result = await fwd_bwd_future.result_async()
+            training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(fwd_bwd_result))
+            async with trace.scope_span("train/optim_wait"):
+                optim_result = await optim_future.result_async()
+            # Move to next iteration
+            if next_fwd_bwd_future is not None and next_optim_future is not None:
+                fwd_bwd_future = next_fwd_bwd_future
+                optim_future = next_optim_future
+    else:
+        for batch in batches:
+            fwd_bwd_future = await enqueue_fwd_bwd(batch)
+            async with trace.scope_span("train/fwd_bwd_wait"):
+                fwd_bwd_result = await fwd_bwd_future.result_async()
+            training_logprobs_D.extend(_training_logprobs_from_fwd_bwd(fwd_bwd_result))
+            optim_future = await enqueue_optim()
+            async with trace.scope_span("train/optim_wait"):
+                optim_result = await optim_future.result_async()
 
     if metrics is not None and optim_result is not None and optim_result.metrics:
         metrics.update(optim_result.metrics)
@@ -496,6 +522,14 @@ class Config:
     enable_trace: bool = False
     # Save a Gantt chart HTML every N iterations (0 = disabled). Requires plotly.
     span_chart_every: int = 0
+    # Enqueue optim_step before consuming the forward_backward result (pipelined;
+    # the historical behavior). Set False to force fwd_bwd -> await -> optim_step,
+    # guaranteeing returned logprobs are computed at pre-update weights even on
+    # backends that don't serialize pipelined ops against the returned tensors.
+    pipeline_optim_step: bool = True
+    # Append per-datum sampler-vs-trainer logprob diagnostics (incl. per-turn
+    # breakdown) to <iteration_dir>/kl_details.jsonl each step.
+    log_kl_details: bool = True
 
     # -------------------------------------------------------------------------
     # Execution mode knobs (advanced)
@@ -1308,7 +1342,16 @@ async def save_checkpoint_and_get_sampling_client(
         return training_client.create_sampling_client(path_dict["sampler_path"]), metrics
     else:
         async with trace.scope_span("save_checkpoint"):
-            return await training_client.save_weights_and_get_sampling_client_async(), metrics
+            sampling_client = await training_client.save_weights_and_get_sampling_client_async()
+        # Loops-only diagnostics: the instrumented SDK stamps weight publish/handover
+        # timing on the training client; absent on other backends.
+        weight_sync_stats = getattr(training_client, "last_weight_sync_stats", None)
+        if weight_sync_stats is not None:
+            metrics["time/weight_sync/submit"] = float(weight_sync_stats.submit_s)
+            metrics["time/weight_sync/op_wait"] = float(weight_sync_stats.op_wait_s)
+            metrics["time/weight_sync/total"] = float(weight_sync_stats.total_s)
+            metrics["policy_version/published"] = float(weight_sync_stats.version)
+        return sampling_client, metrics
 
 
 @trace.scope
@@ -1386,6 +1429,9 @@ async def compute_full_batch_metrics_and_get_sampling_client(
     data_D: list[tinker.Datum],
     training_logprobs_D: list[torch.Tensor],
     do_compute_post_kl: bool,
+    substep_ids_D: list[int] | None = None,
+    kl_details_path: Path | None = None,
+    kl_details_step: int | None = None,
 ) -> tuple[tinker.SamplingClient, dict[str, Any]]:
     """Compute end-of-iteration metrics and return a fresh sampling client.
 
@@ -1405,6 +1451,13 @@ async def compute_full_batch_metrics_and_get_sampling_client(
             returned by the training forward pass.
         do_compute_post_kl (bool): Whether to compute post-update KL metrics
             against the new sampling client (adds an extra sampling call).
+        substep_ids_D (list[int] | None): Optimizer substep index per datum,
+            for per-substep KL breakdown. Defaults to None.
+        kl_details_path (Path | None): If set, append per-datum logprob
+            diagnostics as one JSON line to this file. Defaults to None.
+        kl_details_step (int | None): Training step recorded in the
+            diagnostics line (i_batch here is the checkpoint step, which is
+            offset by one). Defaults to None.
 
     Returns:
         tuple[tinker.SamplingClient, dict[str, Any]]: A sampling client
@@ -1415,8 +1468,18 @@ async def compute_full_batch_metrics_and_get_sampling_client(
 
     # Compute KL metrics
     async with trace.scope_span("compute_kl_sample_train"):
-        kl_sample_train_metrics = compute_kl_sample_train(data_D, training_logprobs_D)
-        metrics.update(kl_sample_train_metrics)
+        kl_details = compute_kl_sample_train_extended(
+            data_D, training_logprobs_D, substep_ids_D=substep_ids_D
+        )
+        metrics.update(kl_details.metrics)
+    if kl_details_path is not None and kl_details.per_datum:
+        kl_details_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "step": kl_details_step if kl_details_step is not None else i_batch,
+            "datums": kl_details.per_datum,
+        }
+        with kl_details_path.open("a") as f:
+            f.write(json.dumps(record) + "\n")
 
     # Get a sampling client using the new weights
     sampling_client, checkpoint_metrics = await save_checkpoint_and_get_sampling_client(
@@ -1666,6 +1729,12 @@ async def do_train_step_and_get_sampling_client(
     )
     metrics.update(prepare_minibatch_metrics)
 
+    # Trainer-side policy version around the optimizer step (Loops-only; None elsewhere).
+    # The property does a small blocking HTTP GET, so keep it off the event loop.
+    trainer_version_pre = await asyncio.to_thread(read_trainer_policy_version, training_client)
+    if trainer_version_pre is not None:
+        metrics["policy_version/trainer_pre"] = float(trainer_version_pre)
+
     training_logprobs_D = await train_step(
         data_D=data_D,
         training_client=training_client,
@@ -1674,7 +1743,27 @@ async def do_train_step_and_get_sampling_client(
         loss_fn=config.loss_fn,
         loss_fn_config=config.loss_fn_config,
         metrics=metrics,
+        pipeline_optim_step=config.pipeline_optim_step,
     )
+
+    trainer_version_post = await asyncio.to_thread(read_trainer_policy_version, training_client)
+    if trainer_version_post is not None:
+        metrics["policy_version/trainer_post"] = float(trainer_version_post)
+
+    # Same partition train_step uses, as a per-datum substep id for the KL breakdown.
+    substep_ids_D: list[int] | None = None
+    if data_D:
+        index_batches = split_list(list(range(len(data_D))), min(config.num_substeps, len(data_D)))
+        substep_ids_D = [0] * len(data_D)
+        for substep_id, index_batch in enumerate(index_batches):
+            for datum_index in index_batch:
+                substep_ids_D[datum_index] = substep_id
+
+    kl_details_path: Path | None = None
+    if config.log_kl_details:
+        iter_dir = iteration_dir(config.log_path, i_batch)
+        if iter_dir is not None:
+            kl_details_path = iter_dir / "kl_details.jsonl"
 
     sampling_client, full_batch_metrics = await compute_full_batch_metrics_and_get_sampling_client(
         training_client,
@@ -1684,6 +1773,9 @@ async def do_train_step_and_get_sampling_client(
         data_D,
         training_logprobs_D,
         config.compute_post_kl,
+        substep_ids_D=substep_ids_D,
+        kl_details_path=kl_details_path,
+        kl_details_step=i_batch,
     )
     metrics.update(full_batch_metrics)
 
@@ -1825,6 +1917,15 @@ async def do_sync_training(
 
                 if config.remove_constant_reward_groups:
                     trajectory_groups_P = remove_constant_reward_groups(trajectory_groups_P)
+
+                # Sampler policy-version / retry diagnostics, read against the trainer
+                # version as it stands right after sampling (Loops-only; no-op elsewhere).
+                trainer_version_at_rollout = await asyncio.to_thread(
+                    read_trainer_policy_version, training_client
+                )
+                metrics.update(
+                    compute_policy_version_metrics(trajectory_groups_P, trainer_version_at_rollout)
+                )
 
                 # Train step
                 sampling_client, train_step_metrics = await do_train_step_and_get_sampling_client(

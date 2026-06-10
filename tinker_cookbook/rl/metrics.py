@@ -6,11 +6,15 @@ and computing training metrics.
 """
 
 import asyncio
+from collections import defaultdict
+from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, cast
 
 import tinker
 import torch
 
+from tinker_cookbook.rl.types import TrajectoryGroup
 from tinker_cookbook.utils import trace
 from tinker_cookbook.utils.misc_utils import safezip
 
@@ -65,6 +69,238 @@ def compute_kl_sample_train(
         "optim/kl_sample_train_v2": kl_sample_train_v2,
         "optim/entropy": entropy_sample,
     }
+
+
+@dataclass(frozen=True)
+class KlSampleTrainDetails:
+    """Extended sampler-vs-trainer KL diagnostics.
+
+    Attributes:
+        metrics (dict[str, float]): Flat metric dict, a superset of
+            :func:`compute_kl_sample_train`'s output, with distributional
+            statistics over per-token logprob differences and importance
+            sampling ratios.
+        per_datum (list[dict[str, Any]]): JSON-safe per-datum records with
+            per-turn breakdowns, suitable for JSONL export.
+    """
+
+    metrics: dict[str, float]
+    per_datum: list[dict[str, Any]]
+
+
+def _mask_runs(action_mask: torch.Tensor) -> list[tuple[int, int]]:
+    """Find contiguous runs of True values in a 1D boolean mask.
+
+    Each run corresponds to one assistant action segment in a multi-turn datum.
+
+    Args:
+        action_mask (torch.Tensor): 1D boolean tensor over the full datum length.
+
+    Returns:
+        list[tuple[int, int]]: ``(start, end)`` index pairs (end exclusive),
+            one per contiguous run of True values, in order.
+    """
+    runs: list[tuple[int, int]] = []
+    start: int | None = None
+    mask_values: list[bool] = action_mask.tolist()
+    for idx, is_action in enumerate(mask_values):
+        if is_action and start is None:
+            start = idx
+        elif not is_action and start is not None:
+            runs.append((start, idx))
+            start = None
+    if start is not None:
+        runs.append((start, len(mask_values)))
+    return runs
+
+
+def compute_kl_sample_train_extended(
+    data_D: list[tinker.Datum],
+    training_logprobs_D: list[torch.Tensor],
+    substep_ids_D: list[int] | None = None,
+) -> KlSampleTrainDetails:
+    """Compute extended sampler-vs-trainer KL diagnostics.
+
+    Builds on :func:`compute_kl_sample_train` by additionally characterizing
+    the *distribution* of per-token logprob differences
+    ``diff = sampling_logprob - training_logprob`` (so the importance sampling
+    ratio used by the ``importance_sampling`` loss is ``exp(-diff)``), both
+    pooled over the batch and per datum / per turn.
+
+    Args:
+        data_D (list[tinker.Datum]): List of datums, each containing
+            ``logprobs`` and ``mask`` tensors in ``loss_fn_inputs``.
+        training_logprobs_D (list[torch.Tensor]): Per-token logprobs from the
+            current training model, one tensor per datum.
+        substep_ids_D (list[int] | None): Optional optimizer-substep id per
+            datum. When given and more than one distinct value is present,
+            per-substep mean diffs are emitted as
+            ``optim/kl_sample_train_v1/substep_{s}``.
+
+    Returns:
+        KlSampleTrainDetails: ``metrics`` (flat floats, superset of
+            :func:`compute_kl_sample_train`) and ``per_datum`` (JSON-safe
+            records with per-turn segmentation). Datums with zero action
+            tokens are skipped in the extended statistics.
+    """
+    metrics: dict[str, float] = dict(compute_kl_sample_train(data_D, training_logprobs_D))
+
+    diffs_per_datum: list[torch.Tensor] = []
+    per_datum: list[dict[str, Any]] = []
+    substep_to_diffs: dict[int, list[torch.Tensor]] = defaultdict(list)
+
+    for datum_idx, (datum, training_logprobs) in enumerate(safezip(data_D, training_logprobs_D)):
+        sampling_logprobs = datum.loss_fn_inputs["logprobs"].to_torch()
+        action_mask = datum.loss_fn_inputs["mask"].to_torch() > 0
+        full_diff = sampling_logprobs - training_logprobs
+        diff = full_diff[action_mask]
+        if len(diff) == 0:
+            # Datum with no action tokens contributes nothing
+            continue
+
+        substep = substep_ids_D[datum_idx] if substep_ids_D is not None else 0
+        diffs_per_datum.append(diff)
+        substep_to_diffs[substep].append(diff)
+
+        turns: list[dict[str, Any]] = []
+        for turn_idx, (start, end) in enumerate(_mask_runs(action_mask)):
+            turn_diff = full_diff[start:end]
+            turns.append(
+                {
+                    "turn_idx": turn_idx,
+                    "n_tokens": end - start,
+                    "mean_diff": turn_diff.mean().item(),
+                    "first_token_diff": turn_diff[0].item(),
+                }
+            )
+
+        is_ratio = torch.exp(-diff)
+        per_datum.append(
+            {
+                "datum_idx": datum_idx,
+                "substep": substep,
+                "n_action_tokens": int(diff.numel()),
+                "mean_diff": diff.mean().item(),
+                "p95_diff": torch.quantile(diff, 0.95).item(),
+                "max_abs_diff": diff.abs().max().item(),
+                "frac_neg": (diff < 0).float().mean().item(),
+                "is_ratio_mean": is_ratio.mean().item(),
+                "is_ratio_max": is_ratio.max().item(),
+                "turns": turns,
+            }
+        )
+
+    if not diffs_per_datum:
+        return KlSampleTrainDetails(metrics=metrics, per_datum=[])
+
+    flat = torch.cat(diffs_per_datum)
+    ratio = torch.exp(-flat)
+    datum_mean_diffs = torch.tensor([diff.mean().item() for diff in diffs_per_datum])
+
+    metrics.update(
+        {
+            "optim/logprob_diff/p05": torch.quantile(flat, 0.05).item(),
+            "optim/logprob_diff/p50": torch.quantile(flat, 0.50).item(),
+            "optim/logprob_diff/p95": torch.quantile(flat, 0.95).item(),
+            "optim/logprob_diff/p99": torch.quantile(flat, 0.99).item(),
+            "optim/logprob_diff/max_abs": flat.abs().max().item(),
+            "optim/logprob_diff/frac_neg": (flat < 0).float().mean().item(),
+            "optim/is_ratio/mean": ratio.mean().item(),
+            "optim/is_ratio/p99": torch.quantile(ratio, 0.99).item(),
+            "optim/is_ratio/max": ratio.max().item(),
+            "optim/is_ratio/frac_gt_2": (ratio > 2.0).float().mean().item(),
+            "optim/is_ratio/frac_lt_half": (ratio < 0.5).float().mean().item(),
+            "optim/kl_datum/p50": torch.quantile(datum_mean_diffs, 0.50).item(),
+            "optim/kl_datum/p95": torch.quantile(datum_mean_diffs, 0.95).item(),
+            "optim/kl_datum/max": datum_mean_diffs.max().item(),
+        }
+    )
+
+    if substep_ids_D is not None and len(set(substep_ids_D)) > 1:
+        for substep, substep_diffs in sorted(substep_to_diffs.items()):
+            metrics[f"optim/kl_sample_train_v1/substep_{substep}"] = (
+                torch.cat(substep_diffs).mean().item()
+            )
+
+    return KlSampleTrainDetails(metrics=metrics, per_datum=per_datum)
+
+
+def compute_policy_version_metrics(
+    trajectory_groups_P: Sequence[TrajectoryGroup],
+    trainer_version_pre: int | None,
+) -> dict[str, float]:
+    """Aggregate sampler policy-version and retry metadata across rollouts.
+
+    Walks every transition's action (:class:`~tinker_cookbook.completers.TokensWithLogprobs`)
+    and collects the optional ``policy_version`` / ``sample_retries`` /
+    ``sample_retry_wait_s`` fields. These are populated only by SDK variants
+    that expose them (e.g. the Loops tinker shim), so keys are emitted only
+    when the corresponding inputs exist.
+
+    Args:
+        trajectory_groups_P (Sequence[TrajectoryGroup]): Trajectory groups
+            from one training batch.
+        trainer_version_pre (int | None): Trainer policy version read before
+            the optimizer step, or ``None`` if unavailable.
+
+    Returns:
+        dict[str, float]: Possibly-empty dict with keys (each emitted only
+            when its inputs exist):
+            - ``policy_version/sampler_min`` / ``sampler_max`` / ``frac_missing``
+            - ``policy_version/trainer_pre``
+            - ``policy_version/lag`` (``trainer_pre - sampler_max``)
+            - ``sample_retry/count_total`` / ``wait_total_s`` / ``wait_max_s``
+    """
+    versions: list[int | None] = []
+    retry_counts: list[int] = []
+    retry_waits: list[float] = []
+    for trajectory_group in trajectory_groups_P:
+        for trajectory in trajectory_group.trajectories_G:
+            for transition in trajectory.transitions:
+                versions.append(transition.ac.policy_version)
+                if transition.ac.sample_retries is not None:
+                    retry_counts.append(transition.ac.sample_retries)
+                if transition.ac.sample_retry_wait_s is not None:
+                    retry_waits.append(transition.ac.sample_retry_wait_s)
+
+    metrics: dict[str, float] = {}
+    known_versions = [version for version in versions if version is not None]
+    if known_versions:
+        metrics["policy_version/sampler_min"] = float(min(known_versions))
+        metrics["policy_version/sampler_max"] = float(max(known_versions))
+        metrics["policy_version/frac_missing"] = 1.0 - len(known_versions) / len(versions)
+    if trainer_version_pre is not None:
+        metrics["policy_version/trainer_pre"] = float(trainer_version_pre)
+        if known_versions:
+            metrics["policy_version/lag"] = float(trainer_version_pre - max(known_versions))
+    if retry_counts or retry_waits:
+        metrics["sample_retry/count_total"] = float(sum(retry_counts))
+        metrics["sample_retry/wait_total_s"] = float(sum(retry_waits))
+        metrics["sample_retry/wait_max_s"] = max(retry_waits, default=0.0)
+    return metrics
+
+
+def read_trainer_policy_version(training_client: tinker.TrainingClient) -> int | None:
+    """Read the trainer's current policy version, if the client exposes one.
+
+    Real Tinker training clients have no ``policy_version`` attribute. On the
+    Loops tinker shim it is a property backed by a blocking (~20ms) HTTP GET
+    that may raise, so any failure is swallowed and reported as ``None``.
+
+    Args:
+        training_client (tinker.TrainingClient): The training client to probe.
+
+    Returns:
+        int | None: The policy version, or ``None`` when the attribute is
+            missing, ``None``, non-integral, or raises on access.
+    """
+    try:
+        version = getattr(training_client, "policy_version", None)
+        if version is None:
+            return None
+        return int(version)
+    except Exception:
+        return None
 
 
 @trace.scope
