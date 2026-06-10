@@ -1469,7 +1469,12 @@ async def compute_full_batch_metrics_and_get_sampling_client(
     # Compute KL metrics
     async with trace.scope_span("compute_kl_sample_train"):
         kl_details = compute_kl_sample_train_extended(
-            data_D, training_logprobs_D, substep_ids_D=substep_ids_D
+            data_D,
+            training_logprobs_D,
+            substep_ids_D=substep_ids_D,
+            # Full sampler/trainer logprob pairs ride along whenever the jsonl
+            # dump is enabled, so divergence can be re-analyzed offline.
+            include_per_token=kl_details_path is not None,
         )
         metrics.update(kl_details.metrics)
     if kl_details_path is not None and kl_details.per_datum:

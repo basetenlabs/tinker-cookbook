@@ -118,6 +118,7 @@ def compute_kl_sample_train_extended(
     data_D: list[tinker.Datum],
     training_logprobs_D: list[torch.Tensor],
     substep_ids_D: list[int] | None = None,
+    include_per_token: bool = False,
 ) -> KlSampleTrainDetails:
     """Compute extended sampler-vs-trainer KL diagnostics.
 
@@ -136,6 +137,12 @@ def compute_kl_sample_train_extended(
             datum. When given and more than one distinct value is present,
             per-substep mean diffs are emitted as
             ``optim/kl_sample_train_v1/substep_{s}``.
+        include_per_token (bool): When True, each per-datum record also
+            carries the raw action-token arrays (``target_tokens``,
+            ``sampling_logprobs``, ``training_logprobs``, rounded to 5
+            decimals) so the full sampler/trainer logprob pairs can be
+            re-analyzed offline. Adds ~tens of MB per run-step at typical
+            batch sizes.
 
     Returns:
         KlSampleTrainDetails: ``metrics`` (flat floats, superset of
@@ -175,20 +182,28 @@ def compute_kl_sample_train_extended(
             )
 
         is_ratio = torch.exp(-diff)
-        per_datum.append(
-            {
-                "datum_idx": datum_idx,
-                "substep": substep,
-                "n_action_tokens": int(diff.numel()),
-                "mean_diff": diff.mean().item(),
-                "p95_diff": torch.quantile(diff, 0.95).item(),
-                "max_abs_diff": diff.abs().max().item(),
-                "frac_neg": (diff < 0).float().mean().item(),
-                "is_ratio_mean": is_ratio.mean().item(),
-                "is_ratio_max": is_ratio.max().item(),
-                "turns": turns,
-            }
-        )
+        record: dict[str, Any] = {
+            "datum_idx": datum_idx,
+            "substep": substep,
+            "n_action_tokens": int(diff.numel()),
+            "mean_diff": diff.mean().item(),
+            "p95_diff": torch.quantile(diff, 0.95).item(),
+            "max_abs_diff": diff.abs().max().item(),
+            "frac_neg": (diff < 0).float().mean().item(),
+            "is_ratio_mean": is_ratio.mean().item(),
+            "is_ratio_max": is_ratio.max().item(),
+            "turns": turns,
+        }
+        if include_per_token:
+            target_tokens = datum.loss_fn_inputs["target_tokens"].to_torch()
+            record["target_tokens"] = [int(t) for t in target_tokens[action_mask].tolist()]
+            record["sampling_logprobs"] = [
+                round(float(lp), 5) for lp in sampling_logprobs[action_mask].tolist()
+            ]
+            record["training_logprobs"] = [
+                round(float(lp), 5) for lp in training_logprobs[action_mask].tolist()
+            ]
+        per_datum.append(record)
 
     if not diffs_per_datum:
         return KlSampleTrainDetails(metrics=metrics, per_datum=[])

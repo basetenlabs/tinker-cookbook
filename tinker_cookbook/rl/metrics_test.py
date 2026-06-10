@@ -216,6 +216,37 @@ class TestComputeKlSampleTrainExtended:
         assert round_tripped == details.per_datum
         assert json.loads(json.dumps(details.metrics)) == details.metrics
 
+    def test_per_token_arrays_excluded_by_default(self):
+        data_D, training_logprobs_D = _make_batch()
+        details = compute_kl_sample_train_extended(data_D, training_logprobs_D)
+        for record in details.per_datum:
+            assert "sampling_logprobs" not in record
+            assert "training_logprobs" not in record
+            assert "target_tokens" not in record
+
+    def test_per_token_arrays_included_on_request(self):
+        data_D, training_logprobs_D = _make_batch()
+        details = compute_kl_sample_train_extended(
+            data_D, training_logprobs_D, include_per_token=True
+        )
+        record0 = details.per_datum[0]
+        n = record0["n_action_tokens"]
+        assert len(record0["target_tokens"]) == n
+        assert len(record0["sampling_logprobs"]) == n
+        assert len(record0["training_logprobs"]) == n
+        # Action-masked positions of datum 0 (mask [0,1,1,0,1], targets 2..6)
+        assert record0["target_tokens"] == [3, 4, 6]
+        # Pairwise diff reconstructs the headline stats (rounded to 5 decimals)
+        diffs = [
+            s - t
+            for s, t in zip(
+                record0["sampling_logprobs"], record0["training_logprobs"], strict=True
+            )
+        ]
+        assert record0["mean_diff"] == pytest.approx(sum(diffs) / n, abs=1e-4)
+        # Still JSON-safe with the arrays attached
+        assert json.loads(json.dumps(details.per_datum)) == details.per_datum
+
 
 # --- compute_policy_version_metrics ---
 
