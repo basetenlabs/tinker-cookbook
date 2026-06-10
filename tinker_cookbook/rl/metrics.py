@@ -6,6 +6,7 @@ and computing training metrics.
 """
 
 import asyncio
+import math
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -156,6 +157,8 @@ def compute_kl_sample_train_extended(
     per_datum: list[dict[str, Any]] = []
     substep_to_diffs: dict[int, list[torch.Tensor]] = defaultdict(list)
 
+    advantages_per_datum: list[torch.Tensor] = []
+
     for datum_idx, (datum, training_logprobs) in enumerate(safezip(data_D, training_logprobs_D)):
         sampling_logprobs = datum.loss_fn_inputs["logprobs"].to_torch()
         action_mask = datum.loss_fn_inputs["mask"].to_torch() > 0
@@ -165,8 +168,10 @@ def compute_kl_sample_train_extended(
             # Datum with no action tokens contributes nothing
             continue
 
+        advantages = datum.loss_fn_inputs["advantages"].to_torch()[action_mask]
         substep = substep_ids_D[datum_idx] if substep_ids_D is not None else 0
         diffs_per_datum.append(diff)
+        advantages_per_datum.append(advantages)
         substep_to_diffs[substep].append(diff)
 
         turns: list[dict[str, Any]] = []
@@ -203,6 +208,7 @@ def compute_kl_sample_train_extended(
             record["training_logprobs"] = [
                 round(float(lp), 5) for lp in training_logprobs[action_mask].tolist()
             ]
+            record["advantages"] = [round(float(a), 5) for a in advantages.tolist()]
         per_datum.append(record)
 
     if not diffs_per_datum:
@@ -230,6 +236,22 @@ def compute_kl_sample_train_extended(
             "optim/kl_datum/max": datum_mean_diffs.max().item(),
         }
     )
+
+    # Advantage-conditioned diffs: same-batch update contamination predicts the
+    # trainer inflates logprobs of advantage-positive tokens, i.e.
+    # mean_adv_pos < mean_adv_neg and a negative diff-advantage correlation.
+    # Honest pre-update logprobs are advantage-blind (both ~equal, corr ~0).
+    advantages_flat = torch.cat(advantages_per_datum)
+    positive_mask = advantages_flat > 0
+    negative_mask = advantages_flat < 0
+    if bool(positive_mask.any()):
+        metrics["optim/logprob_diff/mean_adv_pos"] = flat[positive_mask].mean().item()
+    if bool(negative_mask.any()):
+        metrics["optim/logprob_diff/mean_adv_neg"] = flat[negative_mask].mean().item()
+    if flat.numel() > 1 and flat.std() > 0 and advantages_flat.std() > 0:
+        corr = torch.corrcoef(torch.stack([flat, advantages_flat]))[0, 1].item()
+        if not math.isnan(corr):
+            metrics["optim/logprob_diff/adv_corr"] = corr
 
     if substep_ids_D is not None and len(set(substep_ids_D)) > 1:
         for substep, substep_diffs in sorted(substep_to_diffs.items()):
@@ -369,6 +391,118 @@ async def compute_post_kl(
     kl_post_v2 = 0.5 * (flat_diffs**2).mean().item()
 
     return {"kl_pre_post_v1": kl_post_v1, "kl_pre_post_v2": kl_post_v2}
+
+
+@dataclass(frozen=True)
+class PostKlDetails:
+    """Post-update KL diagnostics, including the trainer-vs-post comparison.
+
+    Attributes:
+        metrics (dict[str, float]): ``kl_pre_post_v1/v2`` (same as
+            :func:`compute_post_kl`) plus ``optim/kl_train_post_v1/v2``,
+            the divergence between the train step's *returned* logprobs and a
+            teacher-forced recompute at the post-update weights. If the
+            backend computes returned logprobs at pre-update weights (the
+            contract), ``kl_train_post`` ~= ``kl_pre_post``; if returned
+            logprobs are contaminated by the same-batch update,
+            ``kl_train_post`` ~= 0 while ``kl_sample_train`` is large.
+        post_logprobs_by_datum (dict[int, list[float | None]]): Action-token
+            logprobs at post-update weights, keyed by datum index (5 decimals;
+            ``None`` where the sampler returned no logprob for a position),
+            aligned with the other per-token arrays in the kl_details dump.
+    """
+
+    metrics: dict[str, float]
+    post_logprobs_by_datum: dict[int, list[float | None]]
+
+
+@trace.scope
+async def compute_post_kl_extended(
+    data_D: list[tinker.Datum],
+    post_sampling_client: tinker.SamplingClient,
+    training_logprobs_D: list[torch.Tensor],
+) -> PostKlDetails:
+    """Three-way logprob comparison: sampler vs trainer vs post-update weights.
+
+    Superset of :func:`compute_post_kl` (same recompute, same
+    ``kl_pre_post_v1/v2`` keys) that additionally compares the train step's
+    returned logprobs against the post-update recompute and returns the raw
+    post-update action-token logprobs for offline analysis.
+
+    Args:
+        data_D (list[tinker.Datum]): Datums with ``logprobs``, ``mask``, and
+            ``target_tokens`` in ``loss_fn_inputs``.
+        post_sampling_client (tinker.SamplingClient): Sampling client loaded
+            with the post-update weights.
+        training_logprobs_D (list[torch.Tensor]): Per-token logprobs returned
+            by the train step's forward-backward, one tensor per datum.
+
+    Returns:
+        PostKlDetails: Metrics plus per-datum post-update logprob arrays.
+    """
+    full_sequence_inputs_D = [
+        datum.model_input.append_int(int(datum.loss_fn_inputs["target_tokens"].data[-1]))
+        for datum in data_D
+    ]
+    new_logprobs_D = await asyncio.gather(
+        *[
+            post_sampling_client.compute_logprobs_async(sequence_input)
+            for sequence_input in full_sequence_inputs_D
+        ]
+    )
+
+    pre_post_diffs: list[torch.Tensor] = []
+    train_post_diffs: list[torch.Tensor] = []
+    post_logprobs_by_datum: dict[int, list[float | None]] = {}
+    n_action_tokens = 0
+    n_missing = 0
+    for datum_idx, (datum, new_logprobs, training_logprobs) in enumerate(
+        safezip(data_D, new_logprobs_D, training_logprobs_D)
+    ):
+        action_mask = datum.loss_fn_inputs["mask"].to_torch() > 0
+        # compute_logprobs returns list[float | None] on both backends: index 0
+        # is always None and the sampler may return None at other positions (or
+        # for the whole sequence). NaN-mask those instead of crashing — the
+        # historical compute_post_kl breaks on the Loops shim exactly here.
+        shifted = list(new_logprobs[1:])
+        if len(shifted) != int(action_mask.numel()):
+            n_action_tokens += int(action_mask.sum())
+            n_missing += int(action_mask.sum())
+            continue
+        post_full = torch.tensor(
+            [float("nan") if logprob is None else float(logprob) for logprob in shifted]
+        )
+        post_actions = post_full[action_mask]
+        if post_actions.numel() == 0:
+            continue
+        valid = ~torch.isnan(post_actions)
+        n_action_tokens += int(post_actions.numel())
+        n_missing += int((~valid).sum())
+        post_logprobs_by_datum[datum_idx] = [
+            None if math.isnan(logprob) else round(logprob, 5) for logprob in post_actions.tolist()
+        ]
+        if bool(valid.any()):
+            prev_logprobs = datum.loss_fn_inputs["logprobs"].to_torch()[action_mask]
+            pre_post_diffs.append(prev_logprobs[valid] - post_actions[valid])
+            train_post_diffs.append(training_logprobs[action_mask][valid] - post_actions[valid])
+
+    metrics: dict[str, float] = {}
+    if n_action_tokens > 0:
+        metrics["optim/post_logprobs_missing_frac"] = n_missing / n_action_tokens
+    if not pre_post_diffs:
+        return PostKlDetails(metrics=metrics, post_logprobs_by_datum=post_logprobs_by_datum)
+
+    pre_post_flat = torch.cat(pre_post_diffs)
+    train_post_flat = torch.cat(train_post_diffs)
+    metrics.update(
+        {
+            "kl_pre_post_v1": pre_post_flat.mean().item(),
+            "kl_pre_post_v2": 0.5 * (pre_post_flat**2).mean().item(),
+            "optim/kl_train_post_v1": train_post_flat.mean().item(),
+            "optim/kl_train_post_v2": 0.5 * (train_post_flat**2).mean().item(),
+        }
+    )
+    return PostKlDetails(metrics=metrics, post_logprobs_by_datum=post_logprobs_by_datum)
 
 
 @trace.scope

@@ -1,5 +1,6 @@
 """Tests for extended KL / policy-version metrics in tinker_cookbook.rl.metrics."""
 
+import asyncio
 import json
 import math
 from typing import Any
@@ -13,6 +14,7 @@ from tinker_cookbook.rl.metrics import (
     compute_kl_sample_train,
     compute_kl_sample_train_extended,
     compute_policy_version_metrics,
+    compute_post_kl_extended,
     read_trainer_policy_version,
 )
 from tinker_cookbook.rl.types import Trajectory, TrajectoryGroup, Transition
@@ -20,15 +22,20 @@ from tinker_cookbook.rl.types import Trajectory, TrajectoryGroup, Transition
 # --- Helpers ---
 
 
-def _make_datum(mask: list[float], sampling_logprobs: list[float]) -> tinker.Datum:
+def _make_datum(
+    mask: list[float],
+    sampling_logprobs: list[float],
+    advantages: list[float] | None = None,
+) -> tinker.Datum:
     n = len(mask)
     assert len(sampling_logprobs) == n
+    advantages_t = torch.zeros(n) if advantages is None else torch.tensor(advantages)
     return tinker.Datum(
         model_input=tinker.ModelInput.from_ints(list(range(1, n + 1))),
         loss_fn_inputs={
             "target_tokens": tinker.TensorData.from_torch(torch.tensor(list(range(2, n + 2)))),
             "logprobs": tinker.TensorData.from_torch(torch.tensor(sampling_logprobs)),
-            "advantages": tinker.TensorData.from_torch(torch.zeros(n)),
+            "advantages": tinker.TensorData.from_torch(advantages_t),
             "mask": tinker.TensorData.from_torch(torch.tensor(mask)),
         },
     )
@@ -335,3 +342,125 @@ class TestReadTrainerPolicyVersion:
     def test_none_value_returns_none(self):
         client: Any = _NoneVersionClient()
         assert read_trainer_policy_version(client) is None
+
+
+# --- advantage-conditioned diffs ---
+
+
+def _make_adv_batch() -> tuple[list[tinker.Datum], list[torch.Tensor]]:
+    """Same diffs as _make_batch but with nonzero advantages on action tokens.
+
+    Action-token (diff, advantage) pairs: (0.5, 1.0), (-0.5, -1.0), (0.5, 1.0), (0.8, 2.0).
+    """
+    data_D = [
+        _make_datum(
+            mask=[0.0, 1.0, 1.0, 0.0, 1.0],
+            sampling_logprobs=[0.0, -1.0, -2.0, 0.0, -3.0],
+            advantages=[0.0, 1.0, -1.0, 0.0, 1.0],
+        ),
+        _make_datum(mask=[0.0, 0.0], sampling_logprobs=[-0.5, -0.5]),
+        _make_datum(mask=[0.0, 1.0], sampling_logprobs=[-0.2, -1.0], advantages=[0.0, 2.0]),
+    ]
+    training_logprobs_D = [
+        torch.tensor([0.0, -1.5, -1.5, 0.0, -3.5]),
+        torch.tensor([-0.5, -0.5]),
+        torch.tensor([-0.2, -1.8]),
+    ]
+    return data_D, training_logprobs_D
+
+
+class TestAdvantageConditionedDiffs:
+    def test_absent_when_advantages_all_zero(self):
+        data_D, training_logprobs_D = _make_batch()
+        details = compute_kl_sample_train_extended(data_D, training_logprobs_D)
+        assert "optim/logprob_diff/mean_adv_pos" not in details.metrics
+        assert "optim/logprob_diff/mean_adv_neg" not in details.metrics
+        assert "optim/logprob_diff/adv_corr" not in details.metrics
+
+    def test_advantage_split_means(self):
+        data_D, training_logprobs_D = _make_adv_batch()
+        details = compute_kl_sample_train_extended(data_D, training_logprobs_D)
+        # adv>0 diffs: 0.5, 0.5, 0.8; adv<0 diffs: -0.5
+        assert details.metrics["optim/logprob_diff/mean_adv_pos"] == pytest.approx(1.8 / 3)
+        assert details.metrics["optim/logprob_diff/mean_adv_neg"] == pytest.approx(-0.5)
+
+    def test_advantage_correlation(self):
+        data_D, training_logprobs_D = _make_adv_batch()
+        details = compute_kl_sample_train_extended(data_D, training_logprobs_D)
+        diffs = torch.tensor([0.5, -0.5, 0.5, 0.8])
+        advs = torch.tensor([1.0, -1.0, 1.0, 2.0])
+        expected = torch.corrcoef(torch.stack([diffs, advs]))[0, 1].item()
+        assert details.metrics["optim/logprob_diff/adv_corr"] == pytest.approx(expected, abs=1e-5)
+
+    def test_per_token_dump_includes_advantages(self):
+        data_D, training_logprobs_D = _make_adv_batch()
+        details = compute_kl_sample_train_extended(
+            data_D, training_logprobs_D, include_per_token=True
+        )
+        assert details.per_datum[0]["advantages"] == [1.0, -1.0, 1.0]
+        assert details.per_datum[1]["advantages"] == [2.0]
+
+
+# --- compute_post_kl_extended ---
+
+
+class _FakeLogprobClient:
+    """Returns canned compute_logprobs responses in call order."""
+
+    def __init__(self, responses: list[list[float | None]]):
+        self._responses = responses
+        self._calls = 0
+
+    async def compute_logprobs_async(self, model_input: tinker.ModelInput) -> list[float | None]:
+        response = self._responses[self._calls]
+        self._calls += 1
+        assert len(response) == model_input.length
+        return response
+
+
+class TestComputePostKlExtended:
+    def _run(self, responses: list[list[float | None]]):
+        data_D, training_logprobs_D = _make_batch()
+        client: Any = _FakeLogprobClient(responses)
+        return asyncio.run(compute_post_kl_extended(data_D, client, training_logprobs_D))
+
+    def test_three_way_comparison(self):
+        # Full sequences are n+1 tokens; index 0 is always None (no context).
+        # Post action logprobs: datum0 -> [-1.2, -1.8, -3.1]; datum2 -> [-1.5].
+        details = self._run(
+            [
+                [None, -9.0, -1.2, -1.8, -9.0, -3.1],
+                [None, -9.0, -9.0],
+                [None, -9.0, -1.5],
+            ]
+        )
+        # pre - post: [0.2, -0.2, 0.1, 0.5]; train - post: [-0.3, 0.3, -0.4, -0.3]
+        assert details.metrics["kl_pre_post_v1"] == pytest.approx(0.15, abs=1e-6)
+        assert details.metrics["optim/kl_train_post_v1"] == pytest.approx(-0.175, abs=1e-6)
+        assert details.metrics["optim/post_logprobs_missing_frac"] == 0.0
+        assert set(details.post_logprobs_by_datum) == {0, 2}
+        assert details.post_logprobs_by_datum[0] == [-1.2, -1.8, -3.1]
+        assert details.post_logprobs_by_datum[2] == [-1.5]
+
+    def test_none_positions_are_masked_not_fatal(self):
+        # Same as above but the sampler returns None for datum0's second action token.
+        details = self._run(
+            [
+                [None, -9.0, -1.2, None, -9.0, -3.1],
+                [None, -9.0, -9.0],
+                [None, -9.0, -1.5],
+            ]
+        )
+        assert details.metrics["optim/post_logprobs_missing_frac"] == pytest.approx(0.25)
+        # pre - post over valid: [0.2, 0.1, 0.5]
+        assert details.metrics["kl_pre_post_v1"] == pytest.approx(0.8 / 3, abs=1e-6)
+        # Array alignment preserved with None at the missing position.
+        assert details.post_logprobs_by_datum[0] == [-1.2, None, -3.1]
+
+    def test_all_none_response_does_not_crash(self):
+        # The shim returns [None]*length when prompt_logprobs is unavailable —
+        # the historical compute_post_kl crashed exactly here.
+        details = self._run([[None] * 6, [None] * 3, [None] * 3])
+        assert details.metrics["optim/post_logprobs_missing_frac"] == 1.0
+        assert "kl_pre_post_v1" not in details.metrics
+        assert "optim/kl_train_post_v1" not in details.metrics

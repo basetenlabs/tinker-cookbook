@@ -40,7 +40,7 @@ from tinker_cookbook.rl.metric_util import RLTestSetEvaluator, compute_trajector
 from tinker_cookbook.rl.metrics import (
     compute_kl_sample_train_extended,
     compute_policy_version_metrics,
-    compute_post_kl,
+    compute_post_kl_extended,
     compute_sampling_client_metrics,
     incorporate_kl_penalty,
     read_trainer_policy_version,
@@ -1477,6 +1477,30 @@ async def compute_full_batch_metrics_and_get_sampling_client(
             include_per_token=kl_details_path is not None,
         )
         metrics.update(kl_details.metrics)
+
+    # Get a sampling client using the new weights
+    sampling_client, checkpoint_metrics = await save_checkpoint_and_get_sampling_client(
+        training_client, checkpoint_mgr, i_batch
+    )
+    metrics.update(checkpoint_metrics)
+
+    # Compute post-KL metrics if configured: a teacher-forced recompute at the
+    # post-update weights, giving the three-way sampler/trainer/post comparison
+    # (kl_train_post ~= 0 means the trainer returned post-update logprobs).
+    if do_compute_post_kl:
+        async with trace.scope_span("compute_post_kl"):
+            post_details = await compute_post_kl_extended(
+                data_D, sampling_client, training_logprobs_D
+            )
+            metrics.update(post_details.metrics)
+        if kl_details_path is not None:
+            for per_datum_record in kl_details.per_datum:
+                post_logprobs = post_details.post_logprobs_by_datum.get(
+                    per_datum_record["datum_idx"]
+                )
+                if post_logprobs is not None:
+                    per_datum_record["post_logprobs"] = post_logprobs
+
     if kl_details_path is not None and kl_details.per_datum:
         kl_details_path.parent.mkdir(parents=True, exist_ok=True)
         record = {
@@ -1485,18 +1509,6 @@ async def compute_full_batch_metrics_and_get_sampling_client(
         }
         with kl_details_path.open("a") as f:
             f.write(json.dumps(record) + "\n")
-
-    # Get a sampling client using the new weights
-    sampling_client, checkpoint_metrics = await save_checkpoint_and_get_sampling_client(
-        training_client, checkpoint_mgr, i_batch
-    )
-    metrics.update(checkpoint_metrics)
-
-    # Compute post-KL metrics if configured
-    if do_compute_post_kl:
-        async with trace.scope_span("compute_post_kl"):
-            post_kl_metrics = await compute_post_kl(data_D, sampling_client)
-            metrics.update(post_kl_metrics)
 
     return sampling_client, metrics
 
