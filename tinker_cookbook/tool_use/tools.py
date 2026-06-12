@@ -256,8 +256,12 @@ class FunctionTool:
             return result
 
         except Exception as e:
+            # Prefix with the exception class: str(e) is empty for the httpx timeout/transport
+            # family (and many others), so a bare "{e}" yields an undiagnosable "Tool execution
+            # failed: ". The class name makes the failure mode legible in trajectory dumps and lets
+            # downstream metrics split timeout vs connect vs HTTP error.
             return error_tool_result(
-                f"Tool execution failed: {e}",
+                f"Tool execution failed: {type(e).__name__}: {e}",
                 call_id=input.call_id or "",
                 name=self.name,
                 error_type="execution_failed",
