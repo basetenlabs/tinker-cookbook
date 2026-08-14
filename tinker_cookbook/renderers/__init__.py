@@ -197,6 +197,7 @@ def get_renderer(
         DeepSeekV3DisableThinkingRenderer,
         DeepSeekV3ThinkingRenderer,
     )
+    from tinker_cookbook.renderers.glm52 import GLM52Renderer
     from tinker_cookbook.renderers.gpt_oss import GptOssRenderer
     from tinker_cookbook.renderers.kimi_k2 import KimiK2Renderer
     from tinker_cookbook.renderers.kimi_k25 import KimiK25DisableThinkingRenderer, KimiK25Renderer
@@ -272,6 +273,10 @@ def get_renderer(
         renderer = Nemotron3UltraDisableThinkingRenderer(tokenizer)
     elif name == "nemotron3_ultra_medium_thinking":
         renderer = Nemotron3UltraMediumThinkingRenderer(tokenizer)
+    elif name == "glm52":
+        renderer = GLM52Renderer(tokenizer)
+    elif name == "glm52_disable_thinking":
+        renderer = GLM52Renderer(tokenizer, enable_thinking=False)
     elif name == "gpt_oss_no_sysprompt":
         renderer = GptOssRenderer(tokenizer, use_system_prompt=False)
     elif name == "gpt_oss_low_reasoning":
