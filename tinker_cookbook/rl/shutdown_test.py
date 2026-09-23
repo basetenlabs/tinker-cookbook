@@ -9,8 +9,123 @@ propagates cleanly through the pipeline without hanging:
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
+import pytest
+
+from tinker_cookbook.rl import train
 from tinker_cookbook.rl.train import _AsyncCounter, _Shutdown
+
+
+@pytest.mark.parametrize("batch_sizes", [(8, 8, 8), (8, 8, 7), (1, 1, 1)])
+def test_async_streaming_drains_complete_batches(monkeypatch, tmp_path, batch_sizes):
+    """A buffered shutdown marker must not overtake the final complete batch."""
+
+    async def scenario():
+        workers_done = asyncio.Event()
+        decrement = _AsyncCounter.decrement_and_get
+
+        async def track_worker_exit(counter):
+            remaining = await decrement(counter)
+            if remaining == 0:
+                workers_done.set()
+            return remaining
+
+        monkeypatch.setattr(_AsyncCounter, "decrement_and_get", track_worker_exit)
+        builders = [Mock() for _ in range(sum(batch_sizes))]
+        for builder in builders:
+            builder.logging_tags.return_value = ["test"]
+        batches = []
+        offset = 0
+        for size in batch_sizes:
+            batches.append(builders[offset : offset + size])
+            offset += size
+        trained = []
+
+        async def prepare(group_builders, *args, **kwargs):
+            # Make later batches and the shutdown marker arrive while the first
+            # optimizer batch is in flight, as they do with fast sampling.
+            await workers_done.wait()
+            trained.extend(group_builders)
+            return [], {}
+
+        sampler = Mock()
+        client = Mock()
+        client.create_sampling_client.return_value = sampler
+        client.forward_backward_async = AsyncMock(
+            return_value=SimpleNamespace(
+                result_async=AsyncMock(return_value=SimpleNamespace(loss_fn_outputs=[]))
+            )
+        )
+        client.optim_step_async = AsyncMock(
+            return_value=SimpleNamespace(
+                result_async=AsyncMock(return_value=SimpleNamespace(metrics={}))
+            )
+        )
+        monkeypatch.setattr(
+            train.checkpoint_utils,
+            "save_checkpoint_async",
+            AsyncMock(return_value={"sampler_path": "test-sampler"}),
+        )
+        monkeypatch.setattr(
+            train,
+            "do_group_rollout_and_filter_constant_reward",
+            AsyncMock(side_effect=lambda *args, **kwargs: Mock()),
+        )
+        monkeypatch.setattr(train, "prepare_minibatch", prepare)
+        monkeypatch.setattr(train, "compute_trajectory_metrics", Mock(return_value={}))
+        monkeypatch.setattr(
+            train,
+            "compute_full_batch_metrics_and_get_sampling_client",
+            AsyncMock(return_value=(sampler, {})),
+        )
+        logger = Mock(store=None)
+        groups_per_batch = batch_sizes[0]
+        config = train.Config(
+            learning_rate=1e-5,
+            dataset_builder=Mock(),
+            model_name="test-model",
+            recipe_name="test",
+            max_tokens=8,
+            log_path=str(tmp_path),
+            async_config=train.AsyncConfig(
+                groups_per_batch=groups_per_batch,
+                max_steps_off_policy=len(batches),
+            ),
+            stream_minibatch_config=train.StreamMinibatchConfig(
+                groups_per_batch=groups_per_batch,
+                num_minibatches=1,
+            ),
+            eval_every=0,
+            span_chart_every=0,
+            rollout_json_export=False,
+        )
+        await asyncio.wait_for(
+            train.do_async_training(
+                start_batch=0,
+                end_batch=len(batches),
+                num_batches=len(batches),
+                config=config,
+                training_client=client,
+                kl_reference_client=None,
+                evaluators=[],
+                dataset=SimpleNamespace(get_batch=batches.__getitem__),
+                ml_logger=logger,
+                tokenizer=Mock(),
+            ),
+            timeout=5,
+        )
+        expected_updates = len(builders) // groups_per_batch
+        assert client.optim_step_async.await_count == expected_updates
+        assert logger.log_metrics.call_count == expected_updates
+        assert len(trained) == expected_updates * groups_per_batch
+        assert len(set(trained)) == len(trained)
+        assert trained == builders[: expected_updates * groups_per_batch]
+        if len(builders) % groups_per_batch == 0:
+            assert set(trained) == set(builders)
+
+    asyncio.run(scenario())
 
 
 class TestAsyncCounter:

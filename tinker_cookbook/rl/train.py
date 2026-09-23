@@ -1127,16 +1127,6 @@ async def do_async_training(
             nonlocal sampling_client_step
             if config.stream_minibatch_config is not None:
                 # Streaming minibatch: delegate queue consumption to the streaming function.
-                # We need to check for shutdown before entering the streaming function,
-                # since it will block on queue.get() internally.
-                wrapped_trajectory_group = await trajectory_groups_queue.get()
-                if isinstance(wrapped_trajectory_group, _Shutdown):
-                    logger.info("[training_loop] Received shutdown signal")
-                    break
-                if wrapped_trajectory_group is None:
-                    continue
-                await trajectory_groups_queue.put(wrapped_trajectory_group)
-
                 with trace.trace_iteration(step=i_batch) as window:
                     streaming_result = await do_train_step_streaming_and_get_sampling_client(
                         config,
