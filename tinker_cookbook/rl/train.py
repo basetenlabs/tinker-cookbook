@@ -442,7 +442,7 @@ class Config:
     # training/sampling calls inherit it.
     recipe_name: str
     # Maximum number of generated tokens per rollout trajectory.
-    max_tokens: int
+    max_tokens: int | None
     # Directory for checkpoints, logs, and traces.
     log_path: str = chz.field(munger=lambda _, s: str(Path(s).expanduser()))
     # Evaluation cadence in training iterations (0 = disabled).
@@ -1849,6 +1849,8 @@ async def do_sync_training(
 async def main(
     config: Config,
     rollout_executor: Executor | None = None,
+    *,
+    service_client: tinker.ServiceClient | None = None,
 ):
     """Main training loop for MDP RL.
 
@@ -1860,6 +1862,8 @@ async def main(
 
     Args:
         config (Config): Training configuration.
+        service_client: Optional compatible client supplied by the caller.
+            Omitted, the native Tinker client is created as before.
         rollout_executor (Executor | None): Optional ``concurrent.futures.Executor``
             for offloading group rollouts to separate processes or remote
             workers. Pass ``ProcessPoolExecutor(max_workers=N,
@@ -1922,10 +1926,11 @@ async def main(
     else:
         start_batch = 0
 
-    service_client = tinker.ServiceClient(
-        base_url=config.base_url,
-        user_metadata=recipe_user_metadata(config.recipe_name),
-    )
+    if service_client is None:
+        service_client = tinker.ServiceClient(
+            base_url=config.base_url,
+            user_metadata=recipe_user_metadata(config.recipe_name),
+        )
     user_metadata: dict[str, str] = {}
     if wandb_link := ml_logger.get_logger_url():
         user_metadata["wandb_link"] = wandb_link

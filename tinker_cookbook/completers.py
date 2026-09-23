@@ -106,7 +106,7 @@ class TinkerTokenCompleter(TokenCompleter):
     """
 
     sampling_client: tinker.SamplingClient
-    max_tokens: int
+    max_tokens: int | None
     temperature: float = 1.0
     context_window: int | None = None
 
@@ -124,11 +124,13 @@ class TinkerTokenCompleter(TokenCompleter):
         (when configured) still applies on top.
         """
         if max_tokens is not None:
-            max_tokens = min(self.max_tokens, max_tokens)
+            if self.max_tokens is not None:
+                max_tokens = min(self.max_tokens, max_tokens)
         else:
             max_tokens = self.max_tokens
         if self.context_window is not None:
-            max_tokens = min(max_tokens, self.context_window - model_input.length)
+            remaining = self.context_window - model_input.length
+            max_tokens = min(max_tokens, remaining) if max_tokens is not None else remaining
             if max_tokens <= 0:
                 raise ValueError(
                     f"Prompt length ({model_input.length}) exceeds context window "

@@ -50,6 +50,14 @@ def _prompt(n_tokens: int) -> tinker.ModelInput:
 
 
 class TestTinkerTokenCompleterMaxTokensOverride:
+    @pytest.mark.parametrize(
+        "override,context,expected", [(None, None, None), (16, None, 16), (None, 20, 16)]
+    )
+    def test_service_default_without_a_completion_cap(self, override, context, expected):
+        completer, client = _make_completer(max_tokens=None, context_window=context)
+        asyncio.run(completer(_prompt(4), stop=["<stop>"], max_tokens=override))
+        assert client.requests[0].max_tokens == expected
+
     def test_default_uses_completer_max_tokens(self):
         completer, client = _make_completer(max_tokens=128)
         asyncio.run(completer(_prompt(4), stop=["<stop>"]))
